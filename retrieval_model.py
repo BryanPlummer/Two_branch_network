@@ -1,8 +1,17 @@
+import pickle
+import numbers
 import tensorflow as tf
 from tensorflow.contrib.layers.python.layers import fully_connected
+from tensorflow.python.framework import constant_op
+from tensorflow.python.framework import ops
+from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import nn
+from tensorflow.python.ops import standard_ops
+from tensorflow.python.platform import tf_logging as logging
+
 
 def add_fc(inputs, outdim, train_phase, scope_in):
-    fc =  fully_connected(inputs, outdim, activation_fn=None, scope=scope_in + '/fc')
+    fc =  fully_connected(inputs, outdim, activation_fn=None, weights_regularizer = tf.contrib.layers.l2_regularizer(0.0005), scope=scope_in + '/fc')
     fc_bnorm = tf.layers.batch_normalization(fc, momentum=0.1, epsilon=1e-5,
                          training=train_phase, name=scope_in + '/bnorm')
     fc_relu = tf.nn.relu(fc_bnorm, name=scope_in + '/relu')
@@ -84,11 +93,135 @@ def recall_k(im_embeds, sent_embeds, im_labels, ks=None):
                    ks, dtype=tf.float32),
          tf.map_fn(lambda k: retrieval_recall(sent_im_dist, im_labels, k),
                    ks, dtype=tf.float32)],
-        axis=0)
+        axis=0), sent_im_dist
 
+def extract_axis_1(data, ind):
+    """
+    Get specified elements along the first axis of tensor.
+    :param data: Tensorflow tensor that will be subsetted.
+    :param ind: Indices to take (one for each element along axis 0 of data).
+    :return: Subsetted tensor.
 
-def embedding_model(im_feats, sent_feats, train_phase, im_labels,
-                    fc_dim = 2048, embed_dim = 512):
+    function copied from - https://stackoverflow.com/questions/41273361/get-the-last-output-of-a-dynamic-rnn-in-tensorflow
+    """
+    batch_range = tf.range(tf.shape(data)[0])
+    indices = tf.stack([batch_range, ind], axis=1)
+    res = tf.gather_nd(data, indices)
+    
+    return res
+
+def weight_l2_regularizer(initial_weights, scale, scope=None):
+  """Returns a function that can be used to apply L2 regularization to weights.
+  Small values of L2 can help prevent overfitting the training data.
+  Args:
+    scale: A scalar multiplier `Tensor`. 0.0 disables the regularizer.
+    scope: An optional scope name.
+  Returns:
+    A function with signature `l2(weights)` that applies L2 regularization.
+  Raises:
+    ValueError: If scale is negative or if scale is not a float.
+  """
+  if isinstance(scale, numbers.Integral):
+    raise ValueError('scale cannot be an integer: %s' % (scale,))
+  if isinstance(scale, numbers.Real):
+    if scale < 0.:
+      raise ValueError('Setting a scale less than 0 on a regularizer: %g.' %
+                       scale)
+    if scale == 0.:
+      logging.info('Scale of 0 disables regularizer.')
+      return lambda _: None
+
+  def l2(weights):
+    """Applies l2 regularization to weights."""
+    with ops.name_scope(scope, 'l2_regularizer', [weights]) as name:
+      my_scale = ops.convert_to_tensor(scale,
+                                       dtype=weights.dtype.base_dtype,
+                                       name='scale')
+      weight_diff = initial_weights - weights
+      return standard_ops.multiply(my_scale, nn.l2_loss(weight_diff), name=name)
+
+  return l2
+
+def setup_initialize_fc_layers(feats, parameters, scope_in, train_phase, args):
+    for i, params in enumerate(parameters):
+            scaling = params['scaling']
+            outdim = len(scaling)
+            cca_mean, cca_proj = params[scope_in + '_mean'], params[scope_in + '_proj']
+            weights_init = tf.constant_initializer(cca_proj, dtype=tf.float32)
+            weight_reg = weight_l2_regularizer(params[scope_in + '_proj'], args.cca_weight_reg)
+            if (i + 1) < len(parameters):
+                activation_fn = tf.nn.relu
+            else:
+                activation_fn = None
+
+            feats = fully_connected(feats - cca_mean, outdim, activation_fn=activation_fn,
+                                    weights_initializer = weights_init,
+                                    weights_regularizer = weight_reg,
+                                    scope = scope_in + '_embed_' + str(i)) * scaling
+
+    feats = tf.nn.l2_normalize(feats, 1, epsilon=1e-10)
+    return feats
+
+def setup_sent_model(tokens, train_phase, vecs, max_length, args, fc_dim = 2048, embed_dim = 512):
+    word_embeddings = tf.get_variable('word_embeddings', vecs.shape, initializer=tf.constant_initializer(vecs))
+    embedded_words = tf.nn.embedding_lookup(word_embeddings, tokens)
+    embed_l2reg = tf.nn.l2_loss(word_embeddings - vecs)
+
+    if args.language_model == 'gru':
+        source_sequence_length = tf.reduce_sum(tf.cast(tokens > 0, tf.int32), 1)
+        encoder_cell = tf.nn.rnn_cell.GRUCell(fc_dim)
+        encoder_outputs, encoder_state = tf.nn.dynamic_rnn(
+            encoder_cell, embedded_words, dtype=tf.float32,
+            sequence_length=source_sequence_length)
+
+        final_outputs = extract_axis_1(encoder_outputs, source_sequence_length-1)
+        outputs = fully_connected(final_outputs, embed_dim, activation_fn = None,
+                                  weights_regularizer = tf.contrib.layers.l2_regularizer(0.005),
+                                  scope = 'phrase_encoder')
+
+        s_embed = tf.nn.l2_normalize(outputs, 1, epsilon=1e-10)
+    else:
+        num_words = tf.reduce_sum(tf.to_float(tokens > 0), 1, keep_dims=True) + 1e-10
+        average_word_embedding = tf.nn.l2_normalize(tf.reduce_sum(embedded_words, 1) / num_words, 1)
+        if args.language_model == 'attend':
+            context_vector = tf.tile(tf.expand_dims(average_word_embedding, 1), (1, max_length, 1))
+            attention_inputs = tf.concat((context_vector, embedded_words), 2)
+            attention_weights = fully_connected(attention_inputs, 1, 
+                                                weights_regularizer = tf.contrib.layers.l2_regularizer(0.0005),
+                                                scope='word_attention')
+            
+            attention_weights = tf.expand_dims(tf.nn.softmax(tf.squeeze(attention_weights)), 2)
+            sent_feats = tf.reshape(tf.nn.l2_normalize(tf.reduce_sum(embedded_words * attention_weights, 1), 1), [-1, vecs.shape[1]])
+        else:
+            sent_feats = average_word_embedding
+
+        if args.init_filename:
+            parameters = pickle.load(open(args.init_filename, 'rb'))
+            s_embed = setup_initialize_fc_layers(sent_feats, parameters, 'lang', train_phase, args)
+        else:
+            sent_fc1 = add_fc(sent_feats, fc_dim, train_phase,'sent_embed_1')
+            sent_fc2 = fully_connected(sent_fc1, embed_dim, activation_fn=None,
+                                       weights_regularizer = tf.contrib.layers.l2_regularizer(0.0005),
+                                       scope = 'sent_embed_2')
+            s_embed = tf.nn.l2_normalize(sent_fc2, 1, epsilon=1e-10)
+
+    return s_embed, embed_l2reg
+
+def setup_img_model(im_feats, train_phase, args, fc_dim = 2048, embed_dim = 512):
+    if args.init_filename:
+        parameters = pickle.load(open(args.init_filename, 'rb'))
+        i_embed = setup_initialize_fc_layers(im_feats, parameters, 'vis', train_phase, args)
+    else:
+        im_fc1 = add_fc(im_feats, fc_dim, train_phase, 'im_embed_1')
+        im_fc2 = fully_connected(im_fc1, embed_dim, activation_fn=None,
+                                 weights_regularizer = tf.contrib.layers.l2_regularizer(0.0005),
+                                 scope = 'im_embed_2')
+        i_embed = tf.nn.l2_normalize(im_fc2, 1, epsilon=1e-10)
+
+    return i_embed
+
+def embedding_model(im_feats, tokens, train_phase, im_labels , vecs, 
+                    max_length, args, fc_dim = 2048, embed_dim = 512):
     """
         Build two-branch embedding networks.
         fc_dim: the output dimension of the first fc layer.
@@ -96,49 +229,19 @@ def embedding_model(im_feats, sent_feats, train_phase, im_labels,
                    embedding space dimension.
     """
     # Image branch.
-    im_fc1 = add_fc(im_feats, fc_dim, train_phase, 'im_embed_1')
-    im_fc2 = fully_connected(im_fc1, embed_dim, activation_fn=None,
-                             scope = 'im_embed_2')
-    i_embed = tf.nn.l2_normalize(im_fc2, 1, epsilon=1e-10)
+    i_embed = setup_img_model(im_feats, train_phase, args, fc_dim, embed_dim)
+
     # Text branch.
-    sent_fc1 = add_fc(sent_feats, fc_dim, train_phase,'sent_embed_1')
-    sent_fc2 = fully_connected(sent_fc1, embed_dim, activation_fn=None,
-                               scope = 'sent_embed_2')
-    s_embed = tf.nn.l2_normalize(sent_fc2, 1, epsilon=1e-10)
-    return i_embed, s_embed
+    s_embed, embed_l2reg = setup_sent_model(tokens, train_phase, vecs, max_length, args, fc_dim, embed_dim)
+    return i_embed, s_embed, embed_l2reg
 
-
-def setup_train_model(im_feats, sent_feats, train_phase, im_labels, args):
+def setup_train_model(im_feats, sent_feats, train_phase, im_labels, vecs, max_length, args):
     # im_feats b x image_feature_dim
     # sent_feats 5b x sent_feature_dim
     # train_phase bool (Should be True.)
     # im_labels 5b x b
-    i_embed, s_embed = embedding_model(im_feats, sent_feats, train_phase, im_labels)
-    loss = embedding_loss(i_embed, s_embed, im_labels, args)
+    i_embed, s_embed, embed_l2reg = embedding_model(im_feats, sent_feats, train_phase, im_labels, vecs, max_length, args)
+    loss = embedding_loss(i_embed, s_embed, im_labels, args) + args.word_embedding_reg * embed_l2reg
     return loss
 
 
-def setup_eval_model(im_feats, sent_feats, train_phase, im_labels):
-    # im_feats b x image_feature_dim
-    # sent_feats 5b x sent_feature_dim
-    # train_phase bool (Should be False.)
-    # im_labels 5b x b
-    i_embed, s_embed = embedding_model(im_feats, sent_feats, train_phase, im_labels)
-    recall = recall_k(i_embed, s_embed, im_labels, ks=tf.convert_to_tensor([1,5,10]))
-    return recall
-
-
-def setup_sent_eval_model(im_feats, sent_feats, train_phase, im_labels, args):
-    # im_feats b x image_feature_dim
-    # sent_feats 5b x sent_feature_dim
-    # train_phase bool (Should be False.)
-    # im_labels 5b x b
-    _, s_embed = embedding_model(im_feats, sent_feats, train_phase, im_labels)
-    # Create 5b x 5b sentence labels, wherthe 5 x 5 blocks along the diagonal
-    num_sent = args.batch_size * args.sample_size
-    sent_labels = tf.reshape(tf.tile(tf.transpose(im_labels),
-                                     [1, args.sample_size]), [num_sent, num_sent])
-    sent_labels = tf.logical_and(sent_labels, ~tf.eye(num_sent, dtype=tf.bool))
-    # For topk, query k+1 since top1 is always the sentence itself, with dist 0.
-    recall = recall_k(s_embed, s_embed, sent_labels, ks=tf.convert_to_tensor([2,6,11]))[:3]
-    return recall
