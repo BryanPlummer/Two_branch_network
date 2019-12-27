@@ -27,7 +27,7 @@ After setting up the datasets, you can train a model using the provided script:
   ./run_two_branch.sh --train 1 flickr gru default_gru
   ```
 
-Training using both `avg` and `attend` language models should take less than an hour on a Titan Xp GPU (on Flickr30K, just a few minutes), but `gru` and other simple alternative recurrent models take considerably longer to train and tends to perform worse on this task when using a pretrained word embedding (see additional results [here]().  More complicated recurrent models may improve performance, however.
+Training using both `avg` and `attend` language models should take less than an hour on a Titan Xp GPU (on Flickr30K, just a few minutes), but `gru` and other simple alternative recurrent models take considerably longer to train and tends to perform worse on this task when using a pretrained word embedding (see additional results [here](http://openaccess.thecvf.com/content_ICCV_2019/papers/Burns_Language_Features_Matter_Effective_Language_Representations_for_Vision-Language_Tasks_ICCV_2019_paper.pdf)).  More complicated recurrent models may improve performance, however.
 
 Evaluating the model on the 1K test splits for each dataset can be accomplished using:
 
@@ -93,7 +93,7 @@ If you use this repo in your project please cite the following papers on the Two
 ```
 
 
-In addition, if you use the MT GrOVLE word embeddings or the self-attention model please also cite:
+In addition, if you use the MT GrOVLE word embeddings, want to compare to ResNet results, or use the self-attention model please also cite:
 
 ``` markdown
 @InProceedings{burnsLanguage2019,
