@@ -4,6 +4,8 @@ This repo is from [Two Branch Networks (Liwei Wang, et al.)](https://github.com/
 
 This code has been tested using python 2.7 and Tensorflow 1.2.1
 
+You can find a pytorch implementation of this codebase [here](https://github.com/BryanPlummer/two_branch_networks), which typically trains a bit faster than this version.
+
 ## Datasets:
 
 You can download and unpack the caption data using:
